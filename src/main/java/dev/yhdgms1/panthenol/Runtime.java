@@ -115,7 +115,11 @@ public final class Runtime {
 
         return TEXTURE_CACHE.computeIfAbsent(cacheKey(profile), k -> {
             MinecraftProfileTextures loaded = invokeLoad(profile);
-            return loaded != null ? loaded : MinecraftProfileTextures.EMPTY;
+            MinecraftProfileTextures result = loaded != null ? loaded : MinecraftProfileTextures.EMPTY;
+            // Any time JS load() actually runs, force Minecraft to re-download those URLs.
+            // Needed for stable skin URLs (same path, new bytes) after rejoin / world login.
+            SkinReload.markTextures(result);
+            return result;
         });
     }
 
@@ -124,12 +128,19 @@ public final class Runtime {
             return;
         }
 
-        TEXTURE_CACHE.remove(cacheKey(profile));
+        MinecraftProfileTextures previous = TEXTURE_CACHE.remove(cacheKey(profile));
+        // Drop Minecraft TextureCache + disk file for the old URLs, otherwise rejoin only
+        // re-queries the API while the client keeps the previously downloaded PNG.
+        SkinReload.markTextures(previous);
     }
 
     public static void onWorldLogin() {
         if (aggressiveCache) {
             return;
+        }
+
+        for (MinecraftProfileTextures textures : TEXTURE_CACHE.values()) {
+            SkinReload.markTextures(textures);
         }
 
         TEXTURE_CACHE.clear();

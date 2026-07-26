@@ -4,7 +4,8 @@
   "compatibilityLevel": "JAVA_21",
   "client": [
     "SkinManagerMixin",
-    "PlayerInfoMixin"
+    "PlayerInfoMixin",
+    "TextureCacheMixin"
   ],
   "injectors": {
     "defaultRequire": 1
