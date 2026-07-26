@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "package": "dev.yhdgms1.panthenol.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "SkinManagerMixin",
+    "PlayerInfoMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  },
+  "minVersion": "0.8"
+}
