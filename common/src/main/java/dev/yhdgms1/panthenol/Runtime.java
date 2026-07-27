@@ -20,6 +20,7 @@ import org.slf4j.Logger;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
+import java.net.URL;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -27,11 +28,15 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Long-lived Rhino runtime for {@code config/panthenol.js}.
@@ -47,6 +52,12 @@ public final class Runtime {
             .connectTimeout(Duration.ofSeconds(10))
             .followRedirects(HttpClient.Redirect.NORMAL)
             .build();
+
+    /**
+     * Matches vanilla {@code HttpURLConnection} default UA used by skin downloads
+     * ({@code SkinTextureDownloader} never sets its own User-Agent).
+     */
+    private static final String DEFAULT_USER_AGENT = "Java/" + System.getProperty("java.version", "unknown");
 
     private static final Callable JSON_IDENTITY_REVIVER = (Context cx, Scriptable scope, Scriptable thisObj, Object[] args) -> args[1];
 
@@ -376,7 +387,14 @@ public final class Runtime {
     // Host: http.get / print / println
     // -------------------------------------------------------------------------
 
-    /** {@code http.get(url[, type[, headers]])} → {@code { body, status }}. */
+    /**
+     * Sync JS API over async Java HTTP.
+     * <pre>
+     *   http.get({ url, mode?, headers? })
+     *   http.get([{ url, mode?, headers? }, ...])  // parallel, returns when all settle
+     * </pre>
+     * Single input → single {@code { body, status }}; array → array of results (same order).
+     */
     private static final BaseFunction HTTP_GET = new BaseFunction() {
         @Override
         public Object call(Context callCx, Scriptable callScope, Scriptable thisObj, Object[] args) {
@@ -385,74 +403,71 @@ public final class Runtime {
                     return httpResult(callCx, callScope, null, 0);
                 }
 
-                String url = callCx.toString(args[0]).trim();
-                if (url.isEmpty()) {
+                Object first = args[0];
+                if (!(first instanceof Scriptable root)) {
                     return httpResult(callCx, callScope, null, 0);
                 }
 
-                String type = "text";
-                if (args.length >= 2 && !isAbsent(args[1])) {
-                    type = callCx.toString(args[1]).trim().toLowerCase(Locale.ROOT);
-                    if (!type.equals("text") && !type.equals("json")) {
-                        return httpResult(callCx, callScope, null, 0);
-                    }
-                }
+                List<HttpSpec> specs = new ArrayList<>();
+                boolean batch;
 
-                Scriptable headersObj = null;
-                if (args.length >= 3 && args[2] instanceof Scriptable s) {
-                    headersObj = s;
-                }
-
-                URI uri;
-                try {
-                    uri = URI.create(url);
-                } catch (IllegalArgumentException | NullPointerException e) {
-                    return httpResult(callCx, callScope, null, 0);
-                }
-                if (uri.getScheme() == null
-                        || !(uri.getScheme().equalsIgnoreCase("http")
-                        || uri.getScheme().equalsIgnoreCase("https"))) {
-                    return httpResult(callCx, callScope, null, 0);
-                }
-
-                HttpRequest.Builder builder = HttpRequest.newBuilder()
-                        .uri(uri)
-                        .timeout(Duration.ofSeconds(15))
-                        .GET()
-                        .header("User-Agent", "Panthenol/1.0")
-                        .header("Accept", type.equals("json") ? "application/json" : "*/*");
-
-                applyHeaders(callCx, builder, headersObj);
-
-                HttpResponse<String> response;
-                try {
-                    response = HTTP.send(builder.build(), HttpResponse.BodyHandlers.ofString());
-                } catch (IOException e) {
-                    return httpResult(callCx, callScope, null, 0);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return httpResult(callCx, callScope, null, 0);
-                }
-
-                int status = response.statusCode();
-                String raw = response.body() != null ? response.body() : "";
-                Object body;
-                if ("json".equals(type)) {
-                    if (raw.isBlank()) {
-                        body = null;
-                    } else {
-                        try {
-                            body = NativeJSON.parse(callCx, callScope, raw, JSON_IDENTITY_REVIVER);
-                        } catch (Exception e) {
-                            LOGGER.debug("JSON parse failed for {} (status {})", url, status, e);
-                            body = null;
+                if (isJsArray(callCx, root)) {
+                    batch = true;
+                    int len = jsArrayLength(callCx, root);
+                    for (int i = 0; i < len; i++) {
+                        Object el = root.get(callCx, i, root);
+                        if (isAbsent(el) || !(el instanceof Scriptable req)) {
+                            specs.add(HttpSpec.invalid());
+                        } else {
+                            specs.add(parseHttpSpec(callCx, req));
                         }
                     }
                 } else {
-                    body = raw;
+                    batch = false;
+                    specs.add(parseHttpSpec(callCx, root));
                 }
-                return httpResult(callCx, callScope, body, status);
+
+                if (specs.isEmpty()) {
+                    return batch ? callCx.newArray(callScope, 0) : httpResult(callCx, callScope, null, 0);
+                }
+
+                // Fire all requests in parallel; JS still blocks until every one finishes.
+                List<CompletableFuture<RawHttp>> futures = new ArrayList<>(specs.size());
+                for (HttpSpec spec : specs) {
+                    futures.add(dispatchAsync(spec));
+                }
+
+                try {
+                    CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).get(30, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    // Individual futures still complete with failures via handle();
+                    // timed-out ones stay incomplete — map below.
+                    if (e instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+
+                Object[] jsResults = new Object[futures.size()];
+                for (int i = 0; i < futures.size(); i++) {
+                    RawHttp raw;
+                    try {
+                        raw = futures.get(i).getNow(null);
+                    } catch (Exception e) {
+                        raw = null;
+                    }
+                    if (raw == null) {
+                        jsResults[i] = httpResult(callCx, callScope, null, 0);
+                    } else {
+                        jsResults[i] = toJsHttpResult(callCx, callScope, raw);
+                    }
+                }
+
+                if (batch) {
+                    return callCx.newArray(callScope, jsResults);
+                }
+                return jsResults[0];
             } catch (Throwable t) {
+                LOGGER.debug("http.get failed", t);
                 return httpResult(callCx, callScope, null, 0);
             }
         }
@@ -463,24 +478,219 @@ public final class Runtime {
         }
     };
 
-    private static void applyHeaders(Context callCx, HttpRequest.Builder builder, Scriptable headersObj) {
-        if (headersObj == null) {
-            return;
+    /** Parsed request spec (plain data only — safe to touch from HTTP worker threads). */
+    private record HttpSpec(String url, String mode, Map<String, String> headers, boolean valid) {
+        static HttpSpec invalid() {
+            return new HttpSpec(null, "text", Map.of(), false);
         }
+    }
+
+    /** I/O result before Rhino conversion (must not hold Scriptable). */
+    private record RawHttp(String mode, int status, String body) {
+        static RawHttp fail(String mode) {
+            return new RawHttp(mode != null ? mode : "text", 0, null);
+        }
+    }
+
+    private static HttpSpec parseHttpSpec(Context callCx, Scriptable req) {
+        String url = extractUrl(callCx, ScriptableObject.getProperty(req, "url", callCx));
+        if (url == null) {
+            return HttpSpec.invalid();
+        }
+
+        String mode = "text";
+        Object modeVal = ScriptableObject.getProperty(req, "mode", callCx);
+        if (!isAbsent(modeVal)) {
+            String m = callCx.toString(modeVal).trim().toLowerCase(Locale.ROOT);
+            if ("json".equals(m) || "text".equals(m)) {
+                mode = m;
+            } else {
+                return HttpSpec.invalid();
+            }
+        }
+
+        Map<String, String> headers = parseHeaders(callCx, ScriptableObject.getProperty(req, "headers", callCx));
+        return new HttpSpec(url, mode, headers, true);
+    }
+
+    private static String extractUrl(Context callCx, Object urlVal) {
+        if (isAbsent(urlVal)) {
+            return null;
+        }
+        if (urlVal instanceof URI uri) {
+            return uri.toString();
+        }
+        if (urlVal instanceof URL url) {
+            return url.toString();
+        }
+        if (urlVal instanceof Scriptable s) {
+            // URL-like: { href: "https://..." }
+            Object href = ScriptableObject.getProperty(s, "href", callCx);
+            if (!isAbsent(href)) {
+                String u = callCx.toString(href).trim();
+                return u.isEmpty() ? null : u;
+            }
+        }
+        if (urlVal instanceof CharSequence || urlVal instanceof String) {
+            String u = callCx.toString(urlVal).trim();
+            return u.isEmpty() ? null : u;
+        }
+        // Fallback toString (e.g. some host wrappers)
+        try {
+            String u = callCx.toString(urlVal).trim();
+            if (u.isEmpty() || "undefined".equals(u) || "null".equals(u) || "[object Object]".equals(u)) {
+                return null;
+            }
+            return u;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static Map<String, String> parseHeaders(Context callCx, Object headersVal) {
+        if (isAbsent(headersVal) || !(headersVal instanceof Scriptable headersObj)) {
+            return Map.of();
+        }
+
+        Map<String, String> out = new HashMap<>();
+
+        // Headers-like: forEach(function (value, key) { ... })
+        Object forEach = ScriptableObject.getProperty(headersObj, "forEach", callCx);
+        if (forEach instanceof Callable forEachFn) {
+            try {
+                BaseFunction visitor = new BaseFunction() {
+                    @Override
+                    public Object call(Context cx, Scriptable scope, Scriptable thisObj, Object[] args) {
+                        if (args != null && args.length >= 2 && !isAbsent(args[0]) && !isAbsent(args[1])) {
+                            String value = cx.toString(args[0]);
+                            String key = cx.toString(args[1]);
+                            if (key != null && !key.isBlank() && value != null) {
+                                out.put(key, value);
+                            }
+                        }
+                        return Undefined.INSTANCE;
+                    }
+                };
+                forEachFn.call(callCx, headersObj, headersObj, new Object[]{visitor});
+                return Map.copyOf(out);
+            } catch (Throwable t) {
+                LOGGER.debug("headers.forEach failed; falling back to plain object", t);
+                out.clear();
+            }
+        }
+
+        // Plain object / Record<string, string>
         for (Object id : headersObj.getIds(callCx)) {
-            if (!(id instanceof String key) || key.isBlank()) {
+            String key;
+            if (id instanceof String s) {
+                key = s;
+            } else if (id instanceof CharSequence cs) {
+                key = cs.toString();
+            } else {
+                continue;
+            }
+            if (key.isBlank()) {
                 continue;
             }
             Object val = headersObj.get(callCx, key, headersObj);
             if (isAbsent(val)) {
                 continue;
             }
+            out.put(key, callCx.toString(val));
+        }
+        return out.isEmpty() ? Map.of() : Map.copyOf(out);
+    }
+
+    private static CompletableFuture<RawHttp> dispatchAsync(HttpSpec spec) {
+        if (!spec.valid || spec.url == null) {
+            return CompletableFuture.completedFuture(RawHttp.fail(spec.mode));
+        }
+
+        URI uri;
+        try {
+            uri = URI.create(spec.url);
+        } catch (IllegalArgumentException | NullPointerException e) {
+            return CompletableFuture.completedFuture(RawHttp.fail(spec.mode));
+        }
+        if (uri.getScheme() == null
+                || !(uri.getScheme().equalsIgnoreCase("http") || uri.getScheme().equalsIgnoreCase("https"))) {
+            return CompletableFuture.completedFuture(RawHttp.fail(spec.mode));
+        }
+
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
+                .uri(uri)
+                .timeout(Duration.ofSeconds(15))
+                .GET()
+                .header("Accept", "json".equals(spec.mode) ? "application/json" : "*/*");
+
+        boolean hasUserAgent = false;
+        for (Map.Entry<String, String> h : spec.headers.entrySet()) {
             try {
-                builder.header(key, callCx.toString(val));
+                builder.header(h.getKey(), h.getValue());
+                if ("user-agent".equalsIgnoreCase(h.getKey())) {
+                    hasUserAgent = true;
+                }
             } catch (IllegalArgumentException ignored) {
                 // skip invalid header
             }
         }
+        if (!hasUserAgent) {
+            builder.header("User-Agent", DEFAULT_USER_AGENT);
+        }
+
+        final String mode = spec.mode;
+        return HTTP.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofString())
+                .handle((response, error) -> {
+                    if (error != null || response == null) {
+                        return RawHttp.fail(mode);
+                    }
+                    String body = response.body() != null ? response.body() : "";
+                    return new RawHttp(mode, response.statusCode(), body);
+                });
+    }
+
+    private static Scriptable toJsHttpResult(Context callCx, Scriptable callScope, RawHttp raw) {
+        Object body;
+        if (raw.body == null) {
+            body = null;
+        } else if ("json".equals(raw.mode)) {
+            if (raw.body.isBlank()) {
+                body = null;
+            } else {
+                try {
+                    body = NativeJSON.parse(callCx, callScope, raw.body, JSON_IDENTITY_REVIVER);
+                } catch (Exception e) {
+                    LOGGER.debug("JSON parse failed (status {})", raw.status, e);
+                    body = null;
+                }
+            }
+        } else {
+            body = raw.body;
+        }
+        return httpResult(callCx, callScope, body, raw.status);
+    }
+
+    private static boolean isJsArray(Context callCx, Scriptable s) {
+        // Prefer real arrays; avoid treating request objects that happen to have length.
+        if (s.getClassName() != null && "Array".equals(s.getClassName())) {
+            return true;
+        }
+        Object length = ScriptableObject.getProperty(s, "length", callCx);
+        if (!(length instanceof Number n) || n.doubleValue() < 0 || n.doubleValue() != Math.floor(n.doubleValue())) {
+            return false;
+        }
+        // Request objects have `url`; arrays of requests should not.
+        Object url = ScriptableObject.getProperty(s, "url", callCx);
+        return isAbsent(url);
+    }
+
+    private static int jsArrayLength(Context callCx, Scriptable s) {
+        Object length = ScriptableObject.getProperty(s, "length", callCx);
+        if (length instanceof Number n) {
+            int len = n.intValue();
+            return Math.max(0, Math.min(len, 16)); // hard cap
+        }
+        return 0;
     }
 
     private static Scriptable httpResult(Context callCx, Scriptable callScope, Object body, int status) {

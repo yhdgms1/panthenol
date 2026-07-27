@@ -8,10 +8,11 @@ const toAbsoluteURL = (url) => {
 };
 
 const load = (params) => {
-    const response = http.get(
-        `https://auth.tlauncher.org/skin/v1/profile/texture/login/${encodeURIComponent(params.name)}`,
-        'json'
-    );
+    // Single request: object form. For several URLs use an array — they run in parallel.
+    const response = http.get({
+        url: `https://auth.tlauncher.org/skin/v1/profile/texture/login/${encodeURIComponent(params.name)}`,
+        mode: 'json'
+    });
 
     if (!response || response.status < 200 || response.status >= 300 || !response.body) {
         return null;

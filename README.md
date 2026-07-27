@@ -94,19 +94,22 @@ To be actually useful some functions were provided.
 
 ### `http.get`
 
+#### Request shape
+
+```ts
+type HttpRequest = {
+  url: string | URL;                 // required (http/https)
+  mode?: 'text' | 'json';            // default 'text'; json parses body
+  headers?: Headers | Record<string, string>;
+};
+```
+
 #### Signature
 
 ```js
-http.get(url)
-http.get(url, type)
-http.get(url, type, headers)
+http.get(request)           // → { body, status }
+http.get([request, ...])    // → [{ body, status }, ...]  (same order, parallel)
 ```
-
-| Argument | Type | Description |
-|----------|------|-------------|
-| `url` | string | Absolute `http` or `https` URL (required) |
-| `type` | `"text"` \| `"json"` | Default `"text"`. `"json"` parses the body |
-| `headers` | object | Optional request headers |
 
 #### Return value
 
@@ -123,23 +126,31 @@ http.get(url, type, headers)
 | Network error, bad URL, etc. | `0` | `null` |
 
 - **Method:** `GET` only
-- **Timeouts:** connect ~10s, request ~15s
-- **User-Agent:** `Panthenol/1.0`
+- **Timeouts:** connect ~10s, request ~15s (per request); batch wait cap ~30s
+- **User-Agent:** `Java/{java.version}` (same default as vanilla `HttpURLConnection` / skin downloads; override via `headers`)
+- **Batch cap:** 16 requests
 - Never throws into script
 
-#### Example
+#### Examples
 
 ```js
-const response = http.get(
-    `https://auth.tlauncher.org/skin/v1/profile/texture/login/${encodeURIComponent(params.name)}`,
-    'json'
-);
+// Single
+const response = http.get({
+    url: `https://auth.tlauncher.org/skin/v1/profile/texture/login/${encodeURIComponent(params.name)}`,
+    mode: 'json'
+});
 
 if (!response || response.status < 200 || response.status >= 300 || !response.body) {
     return null;
 }
 
 const data = response.body;
+
+// Parallel batch — both start together; returns when both finish
+const [a, b] = http.get([
+    { url: 'https://example.com/a.json', mode: 'json' },
+    { url: 'https://example.com/b.txt', mode: 'text', headers: { 'X-Token': '…' } }
+]);
 ```
 
 ### `print` / `println`
@@ -148,7 +159,7 @@ Host-provided logging helpers. **Only string arguments** are accepted.
 
 ```js
 print('no newline');
-println('with newline + mod log line');
+println('with newline');
 ```
 
 | Function | Behavior |
