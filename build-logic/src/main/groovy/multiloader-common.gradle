@@ -1,0 +1,121 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+}
+
+// Gradle Project.description is used in mod metadata expansion.
+project.description = findProperty('mod_description') ?: ''
+
+base {
+    archivesName = "${mod_id}-${project.name}-${minecraft_version}"
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(java_version)
+    withSourcesJar()
+    withJavadocJar()
+}
+
+// Quiet Javadoc: no doclint, never fail the build on missing comments.
+tasks.withType(Javadoc).configureEach {
+    options.encoding = 'UTF-8'
+    // -Xdoclint:none needs to be passed as a single free-form option on some JDKs
+    options.addStringOption('Xdoclint:none', '-quiet')
+    failOnError = false
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        url = 'https://maven.latvian.dev/releases'
+        content {
+            includeGroup 'dev.latvian.mods'
+            includeGroup 'dev.latvian.apps'
+        }
+    }
+    maven {
+        url = 'https://jitpack.io'
+        content {
+            includeGroup 'com.github.rtyley'
+        }
+    }
+    maven {
+        name = 'Quilt'
+        url = 'https://maven.quiltmc.org/repository/release'
+    }
+}
+
+tasks.withType(Jar).configureEach {
+    from(rootProject.file('license')) {
+        rename { "${it}_${mod_name}" }
+    }
+}
+
+jar {
+    manifest {
+        attributes([
+                'Specification-Title'     : mod_name,
+                'Specification-Vendor'    : mod_author,
+                'Specification-Version'   : project.jar.archiveVersion,
+                'Implementation-Title'    : project.name,
+                'Implementation-Version'  : project.jar.archiveVersion,
+                'Implementation-Vendor'   : mod_author,
+                'Built-On-Minecraft'      : minecraft_version
+        ])
+    }
+}
+
+processResources {
+    var expandProps = [
+            'version'                       : version,
+            'group'                         : project.group,
+            'minecraft_version'             : minecraft_version,
+            'minecraft_version_range'       : minecraft_version_range,
+            'fabric_loader_version'         : fabric_loader_version,
+            'mod_name'                      : mod_name,
+            'mod_author'                    : mod_author,
+            'mod_id'                        : mod_id,
+            'license'                       : license,
+            // Must use project.description — bare `description` is the ProcessResources task description.
+            'description'                   : project.description,
+            'neoforge_version'              : neoforge_version,
+            'neoforge_loader_version_range' : neoforge_loader_version_range,
+            'quilt_loader_version'          : quilt_loader_version,
+            'rhino_version'                 : rhino_version,
+            'credits'                       : credits,
+            'java_version'                  : java_version
+    ]
+
+    var jsonExpandProps = expandProps.collectEntries {
+        key, value -> [(key): value instanceof String ? value.replace('\n', '\\\\n') : value]
+    }
+
+    filesMatching(['META-INF/mods.toml', 'META-INF/neoforge.mods.toml', 'quilt.mod.json']) {
+        expand expandProps
+    }
+
+    filesMatching(['pack.mcmeta', 'fabric.mod.json', '*.mixins.json']) {
+        expand jsonExpandProps
+    }
+
+    inputs.properties(expandProps)
+}
+
+publishing {
+    publications {
+        register('mavenJava', MavenPublication) {
+            artifactId base.archivesName.get()
+            from components.java
+        }
+    }
+    repositories {
+        maven {
+            url System.getenv('local_maven_url')
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = Integer.parseInt(java_version)
+}

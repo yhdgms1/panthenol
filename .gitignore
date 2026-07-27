@@ -38,3 +38,8 @@ run/
 **/src/generated/**/.cache/
 repo/
 !**/src/**/repo/
+
+# Multi-loader run dirs
+runs/
+**/runs/
+

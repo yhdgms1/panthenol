@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "quilt_loader": {
+    "group": "${group}",
+    "id": "${mod_id}",
+    "version": "${version}",
+    "metadata": {
+      "name": "${mod_name}",
+      "description": "${description}",
+      "contributors": {
+        "${mod_author}": "Owner"
+      },
+      "license": "${license}"
+    },
+    "entrypoints": {
+      "client_init": [
+        "dev.yhdgms1.panthenol.PanthenolQuilt"
+      ]
+    },
+    "depends": [
+      {
+        "id": "quilt_loader",
+        "versions": ">=${quilt_loader_version}"
+      },
+      {
+        "id": "minecraft",
+        "versions": "~${minecraft_version}"
+      }
+    ]
+  },
+  "mixin": [
+    "${mod_id}.mixins.json"
+  ]
+}

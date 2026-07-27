@@ -1,0 +1,62 @@
+plugins {
+    id 'multiloader-loader'
+    id 'net.fabricmc.fabric-loom'
+}
+
+repositories {
+    maven {
+        name = 'Quilt'
+        url = 'https://maven.quiltmc.org/repository/release'
+    }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+    // Fabric Loom's run configs always launch net.fabricmc.loader...KnotClient.
+    // Use Fabric Loader in the IDE; the published jar still carries quilt.mod.json
+    // so Quilt Loader can load it in production (Fabric interop + native metadata).
+    implementation "net.fabricmc:fabric-loader:${fabric_loader_version}"
+
+    // Embed Rhino inside the mod jar (nested jar). Players do not need a separate Rhino install.
+    include(implementation("dev.latvian.mods:rhino:${rhino_version}"))
+}
+
+loom {
+    def aw = project(':common').file("src/main/resources/${mod_id}.accesswidener")
+    if (aw.exists()) {
+        accessWidenerPath.set(aw)
+    }
+    runs {
+        client {
+            client()
+            setConfigName('Quilt Client')
+            ideConfigGenerated(true)
+            runDir('runs/client')
+            programArgs '--username', client_username
+        }
+        server {
+            server()
+            setConfigName('Quilt Server')
+            ideConfigGenerated(true)
+            runDir('runs/server')
+        }
+    }
+}
+
+def loaderAttribute = Attribute.of('io.github.mcgradleconventions.loader', String)
+['apiElements', 'runtimeElements', 'sourcesElements', 'javadocElements', 'includeInternal', 'modCompileClasspath'].each { variant ->
+    configurations.named(variant) {
+        attributes {
+            attribute(loaderAttribute, 'quilt')
+        }
+    }
+}
+sourceSets.configureEach {
+    [it.compileClasspathConfigurationName, it.runtimeClasspathConfigurationName].each { variant ->
+        configurations.named(variant) {
+            attributes {
+                attribute(loaderAttribute, 'quilt')
+            }
+        }
+    }
+}

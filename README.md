@@ -4,6 +4,22 @@ Panthenol
 
 Client-side custom skin/cape loader driven by JavaScript (this is crazy). This mod was vibecoded using [Grok Build](https://grok.com/build) with Grok 4.5 model. Project uses [Rhino](https://modrinth.com/mod/rhino) library for configuration.
 
+## Building
+
+```bash
+./gradlew build
+```
+
+Jars land in:
+
+| Loader   | Output                                         |
+|----------|------------------------------------------------|
+| Fabric   | `fabric/build/libs/panthenol-fabric-*.jar`     |
+| NeoForge | `neoforge/build/libs/panthenol-neoforge-*.jar` |
+| Quilt    | `quilt/build/libs/panthenol-quilt-*.jar`       |
+
+Shared logic lives in `common/`. Loader modules only provide entrypoints and platform services.
+
 ## Overview
 
 This mod will create Rhino `Context` and global scope using `initStandardObjects` which will provide functions, constants, and built-ins. Then `config/panthenol.js` will be evaluated and kept alive for the whole game session. When Minecraft would load a player skin, cape, or elytra it will intercept that call and call `load` function from JavaScript file. The config is also stored in that script.
