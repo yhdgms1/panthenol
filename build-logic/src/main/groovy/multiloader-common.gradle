@@ -39,10 +39,6 @@ repositories {
             includeGroup 'com.github.rtyley'
         }
     }
-    maven {
-        name = 'Quilt'
-        url = 'https://maven.quiltmc.org/repository/release'
-    }
 }
 
 tasks.withType(Jar).configureEach {
@@ -72,6 +68,7 @@ processResources {
             'minecraft_version'             : minecraft_version,
             'minecraft_version_range'       : minecraft_version_range,
             'fabric_loader_version'         : fabric_loader_version,
+            'quilt_loader_version'          : quilt_loader_version,
             'mod_name'                      : mod_name,
             'mod_author'                    : mod_author,
             'mod_id'                        : mod_id,
@@ -80,7 +77,6 @@ processResources {
             'description'                   : project.description,
             'neoforge_version'              : neoforge_version,
             'neoforge_loader_version_range' : neoforge_loader_version_range,
-            'quilt_loader_version'          : quilt_loader_version,
             'rhino_version'                 : rhino_version,
             'credits'                       : credits,
             'java_version'                  : java_version

@@ -12,9 +12,10 @@
       },
       "license": "${license}"
     },
+    "intermediate_mappings": "net.fabricmc:intermediary",
     "entrypoints": {
       "client_init": [
-        "dev.yhdgms1.panthenol.PanthenolQuilt"
+        "dev.yhdgms1.panthenol.PanthenolFabric"
       ]
     },
     "depends": [

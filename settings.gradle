@@ -13,10 +13,6 @@ pluginManagement {
                 includeGroupAndSubgroups('net.fabricmc')
             }
         }
-        maven {
-            name = 'Quilt'
-            url = uri('https://maven.quiltmc.org/repository/release')
-        }
     }
 }
 
@@ -29,4 +25,3 @@ includeBuild('build-logic')
 include('common')
 include('fabric')
 include('neoforge')
-include('quilt')
