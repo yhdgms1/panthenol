@@ -68,7 +68,6 @@ processResources {
             'minecraft_version'             : minecraft_version,
             'minecraft_version_range'       : minecraft_version_range,
             'fabric_loader_version'         : fabric_loader_version,
-            'quilt_loader_version'          : quilt_loader_version,
             'mod_name'                      : mod_name,
             'mod_author'                    : mod_author,
             'mod_id'                        : mod_id,
@@ -86,7 +85,7 @@ processResources {
         key, value -> [(key): value instanceof String ? value.replace('\n', '\\\\n') : value]
     }
 
-    filesMatching(['META-INF/mods.toml', 'META-INF/neoforge.mods.toml', 'quilt.mod.json']) {
+    filesMatching(['META-INF/mods.toml', 'META-INF/neoforge.mods.toml']) {
         expand expandProps
     }
 

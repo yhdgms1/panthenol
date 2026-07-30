@@ -17,7 +17,7 @@ Jars land in:
 | Fabric   | `fabric/build/libs/panthenol-fabric-*.jar`     |
 | NeoForge | `neoforge/build/libs/panthenol-neoforge-*.jar` |
 
-The Fabric jar is dual-tagged for **Quilt**: it ships both `fabric.mod.json` and `quilt.mod.json` (same jar, no separate Quilt build). Shared logic lives in `common/`. Loader modules only provide entrypoints and platform services.
+Shared logic lives in `common/`. Loader modules only provide entrypoints and platform services.
 
 ## Overview
 
