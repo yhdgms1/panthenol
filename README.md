@@ -86,7 +86,7 @@ const remote = http.get({ url: 'https://example.com/a.png', mode: 'texture' });
 const local  = fs.readFile({ path: 'panthenol/skins/steve.png' }); // mode defaults to 'texture'
 
 return {
-    skin: { texture: local.body, model: 'slim' }
+    skin: { texture: local, model: 'slim' }
     // or: skin: { texture: remote.body, model: 'slim' }
 };
 ```
@@ -130,20 +130,19 @@ http.get([request, ...])  // parallel batch
 
 ### `fs.readFile`
 
-Paths under game **`config/`** (no escape outside).
+Returns the value directly (not an HTTP-style object). `null` on any error.
 
 ```js
 fs.readFile({ path: 'panthenol/skins/steve.png', mode: 'texture' })
-// → { body, status }   status 200 | 0
+// → Symbol | string | parsed JSON | null
 ```
 
-| `mode` | `body` |
-|--------|--------|
-| `"texture"` (**default**) | Symbol handle or `null` |
-| `"text"` | UTF-8 string |
-| `"json"` | parsed JSON or `null` |
-
-Max size ~8 MiB.
+| Argument | Required | Allowed values                        | Return value |
+|----------|----------|---------------------------------------|--------------|
+| `path` | yes | relative or absolute inside `config/` | invalid / missing / outside config / > ~8 MiB → `null` |
+| `mode` | no | `"texture"` (**default**)             | `Symbol` or `null` if empty |
+| | | `"text"`                              | UTF-8 `string` |
+| | | `"json"`                              | parsed JSON, or `null` if blank/invalid |
 
 ### `print` / `println`
 

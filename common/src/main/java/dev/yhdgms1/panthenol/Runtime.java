@@ -825,16 +825,16 @@ public final class Runtime {
         public Object call(Context callCx, Scriptable callScope, Scriptable thisObj, Object[] args) {
             try {
                 if (args == null || args.length == 0 || isAbsent(args[0]) || !(args[0] instanceof Scriptable req)) {
-                    return httpResult(callCx, callScope, null, 0);
+                    return null;
                 }
 
                 Object pathVal = ScriptableObject.getProperty(req, "path", callCx);
                 if (isAbsent(pathVal)) {
-                    return httpResult(callCx, callScope, null, 0);
+                    return null;
                 }
                 String pathStr = callCx.toString(pathVal).trim();
                 if (pathStr.isEmpty() || "null".equals(pathStr) || "undefined".equals(pathStr)) {
-                    return httpResult(callCx, callScope, null, 0);
+                    return null;
                 }
 
                 String mode = "texture";
@@ -844,55 +844,50 @@ public final class Runtime {
                     if ("texture".equals(m) || "text".equals(m) || "json".equals(m)) {
                         mode = m;
                     } else {
-                        return httpResult(callCx, callScope, null, 0);
+                        return null;
                     }
                 }
 
                 Path resolved = resolveConfigPath(pathStr);
                 if (resolved == null) {
                     LOGGER.debug("fs.readFile rejected path: {}", pathStr);
-                    return httpResult(callCx, callScope, null, 0);
+                    return null;
                 }
 
                 if (!Files.isRegularFile(resolved)) {
-                    return httpResult(callCx, callScope, null, 0);
+                    return null;
                 }
 
                 long size = Files.size(resolved);
                 if (size < 0 || size > MAX_TEXTURE_BYTES) {
                     LOGGER.warn("fs.readFile too large or invalid ({} bytes): {}", size, resolved);
-                    return httpResult(callCx, callScope, null, 0);
+                    return null;
                 }
 
                 byte[] bytes = Files.readAllBytes(resolved);
 
-                Object body;
                 if ("texture".equals(mode)) {
                     if (bytes.length == 0) {
-                        body = null;
-                    } else {
-                        body = TextureHandles.create(callCx, callScope, bytes);
+                        return null;
                     }
-                } else if ("json".equals(mode)) {
+                    return TextureHandles.create(callCx, callScope, bytes);
+                }
+                if ("json".equals(mode)) {
                     String text = new String(bytes, StandardCharsets.UTF_8);
                     if (text.isBlank()) {
-                        body = null;
-                    } else {
-                        try {
-                            body = NativeJSON.parse(callCx, callScope, text, JSON_IDENTITY_REVIVER);
-                        } catch (Exception e) {
-                            LOGGER.debug("fs.readFile JSON parse failed for {}", resolved, e);
-                            body = null;
-                        }
+                        return null;
                     }
-                } else {
-                    body = new String(bytes, StandardCharsets.UTF_8);
+                    try {
+                        return NativeJSON.parse(callCx, callScope, text, JSON_IDENTITY_REVIVER);
+                    } catch (Exception e) {
+                        LOGGER.debug("fs.readFile JSON parse failed for {}", resolved, e);
+                        return null;
+                    }
                 }
-
-                return httpResult(callCx, callScope, body, body == null && !"text".equals(mode) ? 0 : 200);
+                return new String(bytes, StandardCharsets.UTF_8);
             } catch (Throwable t) {
                 LOGGER.debug("fs.readFile failed", t);
-                return httpResult(callCx, callScope, null, 0);
+                return null;
             }
         }
 

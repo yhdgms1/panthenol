@@ -20,7 +20,7 @@ const isSuccess = function (response) {
  *
  * Examples:
  *   skin: { texture: 'https://…/a.png', model: 'slim' }
- *   skin: { texture: fs.readFile({ path: 'panthenol/a.png' }).body, model: 'slim' }
+ *   skin: { texture: fs.readFile({ path: 'panthenol/a.png' }), model: 'slim' }
  *   cape: handle   // shorthand when no model
  */
 const load = function (params) {
