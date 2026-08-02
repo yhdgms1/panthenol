@@ -36,10 +36,15 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Long-lived Rhino runtime for {@code config/panthenol.js}.
+ * All Rhino work runs on a single daemon thread so {@link #resolveTexturesAsync}
+ * never blocks the caller on script or network.
  */
 public final class Runtime {
     private static final Logger LOGGER = LogUtils.getLogger();
@@ -47,24 +52,29 @@ public final class Runtime {
     private static final String DEFAULT_SCRIPT_RESOURCE = "/panthenol.default.js";
 
     private static final boolean DEFAULT_AGGRESSIVE_CACHE = false;
+    private static final int MAX_TEXTURE_BYTES = 8 * 1024 * 1024;
 
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .followRedirects(HttpClient.Redirect.NORMAL)
             .build();
 
-    /**
-     * Matches vanilla {@code HttpURLConnection} default UA used by skin downloads
-     * ({@code SkinTextureDownloader} never sets its own User-Agent).
-     */
+    // Matches vanilla HttpURLConnection UA (SkinTextureDownloader sets none).
     private static final String DEFAULT_USER_AGENT = "Java/" + System.getProperty("java.version", "unknown");
 
     private static final Callable JSON_IDENTITY_REVIVER = (Context cx, Scriptable scope, Scriptable thisObj, Object[] args) -> args[1];
 
-    private static final Object LOCK = new Object();
+    private static final ThreadFactory JS_THREAD_FACTORY = runnable -> {
+        Thread t = new Thread(runnable, "panthenol-js");
+        t.setDaemon(true);
+        return t;
+    };
 
-    /** In-session memo so repeated lookups do not re-hit the network. */
-    private static final ConcurrentHashMap<String, MinecraftProfileTextures> TEXTURE_CACHE = new ConcurrentHashMap<>();
+    // Rhino Context is not freely concurrent.
+    private static final ExecutorService JS_EXECUTOR = Executors.newSingleThreadExecutor(JS_THREAD_FACTORY);
+
+    private static final ConcurrentHashMap<String, CompletableFuture<MinecraftProfileTextures>> TEXTURE_CACHE =
+            new ConcurrentHashMap<>();
 
     private static volatile boolean started;
     private static volatile boolean available;
@@ -77,59 +87,73 @@ public final class Runtime {
     private Runtime() {
     }
 
-    // -------------------------------------------------------------------------
-    // Public API
-    // -------------------------------------------------------------------------
-
     public static boolean isAvailable() {
         return available;
     }
 
-    /** Starts once and keeps the JS scope alive for the client session. */
     public static void start() {
         if (started) {
             return;
         }
-        synchronized (LOCK) {
+        synchronized (Runtime.class) {
             if (started) {
                 return;
             }
             started = true;
             try {
-                bootstrap();
-            } catch (Throwable t) {
+                JS_EXECUTOR.submit(() -> {
+                    try {
+                        bootstrap();
+                    } catch (Throwable t) {
+                        available = false;
+                        loadFunction = null;
+                        LOGGER.error("Failed to start Panthenol JS runtime", t);
+                    }
+                }).get(60, TimeUnit.SECONDS);
+            } catch (Exception e) {
                 available = false;
                 loadFunction = null;
-                LOGGER.error("Failed to start Panthenol JS runtime", t);
+                LOGGER.error("Failed to start Panthenol JS runtime", e);
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
     }
 
-    /**
-     * Resolve textures via JS {@code load(params)}, memoized per profile.
-     *
-     * @return textures, {@link MinecraftProfileTextures#EMPTY} when load has nothing,
-     *         or {@code null} if the runtime is unavailable
-     */
-    public static MinecraftProfileTextures resolveTextures(GameProfile profile) {
+    public static CompletableFuture<MinecraftProfileTextures> resolveTexturesAsync(GameProfile profile) {
         if (profile == null) {
-            return null;
+            return CompletableFuture.completedFuture(null);
         }
 
         start();
 
         if (!available || loadFunction == null) {
-            return null;
+            return CompletableFuture.completedFuture(null);
         }
 
-        return TEXTURE_CACHE.computeIfAbsent(cacheKey(profile), k -> {
-            MinecraftProfileTextures loaded = invokeLoad(profile);
-            MinecraftProfileTextures result = loaded != null ? loaded : MinecraftProfileTextures.EMPTY;
-            // Any time JS load() actually runs, force Minecraft to re-download those URLs.
-            // Needed for stable skin URLs (same path, new bytes) after rejoin / world login.
-            SkinReload.markTextures(result);
-            return result;
-        });
+        String key = cacheKey(profile);
+        return TEXTURE_CACHE.computeIfAbsent(key, k ->
+                CompletableFuture
+                        .supplyAsync(() -> invokeLoadSafe(profile), JS_EXECUTOR)
+                        .thenCompose(pending -> {
+                            if (pending == null) {
+                                return CompletableFuture.completedFuture(MinecraftProfileTextures.EMPTY);
+                            }
+                            // Download off the JS thread so other load() calls can proceed.
+                            return materializeAsync(pending);
+                        })
+                        .thenApply(result -> {
+                            MinecraftProfileTextures out =
+                                    result != null ? result : MinecraftProfileTextures.EMPTY;
+                            SkinReload.markTextures(out);
+                            return out;
+                        })
+                        .exceptionally(t -> {
+                            LOGGER.error("Panthenol load failed for {}", profile.name(), t);
+                            return MinecraftProfileTextures.EMPTY;
+                        })
+        );
     }
 
     public static void invalidate(GameProfile profile) {
@@ -137,10 +161,13 @@ public final class Runtime {
             return;
         }
 
-        MinecraftProfileTextures previous = TEXTURE_CACHE.remove(cacheKey(profile));
-        // Drop Minecraft TextureCache + disk file for the old URLs, otherwise rejoin only
-        // re-queries the API while the client keeps the previously downloaded PNG.
-        SkinReload.markTextures(previous);
+        CompletableFuture<MinecraftProfileTextures> previous = TEXTURE_CACHE.remove(cacheKey(profile));
+        if (previous != null && previous.isDone() && !previous.isCompletedExceptionally()) {
+            try {
+                SkinReload.markTextures(previous.getNow(null));
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     public static void onWorldLogin() {
@@ -148,16 +175,17 @@ public final class Runtime {
             return;
         }
 
-        for (MinecraftProfileTextures textures : TEXTURE_CACHE.values()) {
-            SkinReload.markTextures(textures);
+        for (CompletableFuture<MinecraftProfileTextures> future : TEXTURE_CACHE.values()) {
+            if (future != null && future.isDone() && !future.isCompletedExceptionally()) {
+                try {
+                    SkinReload.markTextures(future.getNow(null));
+                } catch (Exception ignored) {
+                }
+            }
         }
 
         TEXTURE_CACHE.clear();
     }
-
-    // -------------------------------------------------------------------------
-    // Bootstrap
-    // -------------------------------------------------------------------------
 
     private static void bootstrap() throws Exception {
         Path scriptPath = scriptPath();
@@ -194,6 +222,11 @@ public final class Runtime {
         Scriptable http = cx.newObject(scope);
         ScriptableObject.putProperty(http, "get", HTTP_GET, cx);
         ScriptableObject.putProperty(scope, "http", http, cx);
+
+        Scriptable fs = cx.newObject(scope);
+        ScriptableObject.putProperty(fs, "readFile", FS_READ_FILE, cx);
+        ScriptableObject.putProperty(scope, "fs", fs, cx);
+
         ScriptableObject.putProperty(scope, "print", PRINT, cx);
         ScriptableObject.putProperty(scope, "println", PRINTLN, cx);
     }
@@ -217,83 +250,94 @@ public final class Runtime {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // load() → textures
-    // -------------------------------------------------------------------------
-
-    private static MinecraftProfileTextures invokeLoad(GameProfile profile) {
-        synchronized (LOCK) {
-            if (!available || loadFunction == null || cx == null || scope == null) {
-                return null;
-            }
-
-            try {
-                Scriptable params = cx.newObject(scope);
-                String name = profile.name() != null ? profile.name() : "";
-                ScriptableObject.putProperty(params, "name", name, cx);
-                ScriptableObject.putProperty(params, "username", name, cx);
-
-                if (profile.id() != null) {
-                    ScriptableObject.putProperty(params, "uuid", profile.id().toString(), cx);
-                }
-
-                Object result = cx.callSync((Callable) loadFunction, scope, scope, new Object[]{params});
-
-                if (result == null || result == Undefined.INSTANCE || result == Scriptable.NOT_FOUND) {
-                    return null;
-                }
-
-                return parseLoadResult(result);
-            } catch (Throwable t) {
-                LOGGER.error("panthenol.js load() failed for {}", profile.name(), t);
-                return null;
-            }
+    private static PendingTextures invokeLoadSafe(GameProfile profile) {
+        if (!available || loadFunction == null || cx == null || scope == null) {
+            return null;
+        }
+        try {
+            return invokeLoad(profile);
+        } catch (Throwable t) {
+            LOGGER.error("panthenol.js load() failed for {}", profile.name(), t);
+            return null;
         }
     }
 
-    private static MinecraftProfileTextures parseLoadResult(Object result) {
+    private static PendingTextures invokeLoad(GameProfile profile) {
+        Scriptable params = cx.newObject(scope);
+        String name = profile.name() != null ? profile.name() : "";
+        ScriptableObject.putProperty(params, "name", name, cx);
+        ScriptableObject.putProperty(params, "username", name, cx);
+
+        if (profile.id() != null) {
+            ScriptableObject.putProperty(params, "uuid", profile.id().toString(), cx);
+        }
+
+        Object result = cx.callSync((Callable) loadFunction, scope, scope, new Object[]{params});
+
+        if (result == null || result == Undefined.INSTANCE || result == Scriptable.NOT_FOUND) {
+            return null;
+        }
+
+        return parseLoadResult(result);
+    }
+
+    private record PendingTexture(String contentId, String url, Map<String, String> metadata) {
+        boolean isEmpty() {
+            return (contentId == null || contentId.isBlank()) && (url == null || url.isBlank());
+        }
+    }
+
+    private record PendingTextures(PendingTexture skin, PendingTexture cape, PendingTexture elytra) {
+    }
+
+    private static PendingTextures parseLoadResult(Object result) {
         if (!(result instanceof Scriptable root)) {
             LOGGER.debug("load() must return an object, got {}", result == null ? "null" : result.getClass().getName());
             return null;
         }
 
-        MinecraftProfileTexture skin = textureOf(root, "skin", true);
-        MinecraftProfileTexture cape = textureOf(root, "cape", false);
-        MinecraftProfileTexture elytra = textureOf(root, "elytra", false);
+        PendingTexture skin = pendingTextureOf(root, "skin", true);
+        PendingTexture cape = pendingTextureOf(root, "cape", false);
+        PendingTexture elytra = pendingTextureOf(root, "elytra", false);
 
         if (skin == null && cape == null && elytra == null) {
             return null;
         }
 
-        return new MinecraftProfileTextures(skin, cape, elytra, SignatureState.SIGNED);
+        return new PendingTextures(skin, cape, elytra);
     }
 
-    private static MinecraftProfileTexture textureOf(Scriptable root, String key, boolean allowModel) {
+    private static PendingTexture pendingTextureOf(Scriptable root, String key, boolean allowModel) {
         Object el = ScriptableObject.getProperty(root, key, cx);
         if (el == null || el == Scriptable.NOT_FOUND || el == Undefined.INSTANCE) {
             return null;
         }
+
+        // NativeSymbol is Scriptable — check handles before object form.
+        if (TextureHandles.isHandle(el)) {
+            return resolveTextureRef(el, key, null);
+        }
+
+        if (el instanceof CharSequence) {
+            return resolveTextureRef(el, key, null);
+        }
+
         if (!(el instanceof Scriptable tex)) {
-            LOGGER.debug("load().{} must be {{ url, model? }}", key);
+            LOGGER.debug("load().{} must be a URL string, Symbol handle, or {{ texture, model? }}", key);
             return null;
         }
 
-        Object urlVal = ScriptableObject.getProperty(tex, "url", cx);
-        if (urlVal == null || urlVal == Scriptable.NOT_FOUND || urlVal == Undefined.INSTANCE) {
-            return null;
+        if ("String".equals(tex.getClassName())) {
+            return resolveTextureRef(cx.toString(tex), key, null);
         }
-        String url = cx.toString(urlVal);
-        if (url == null || url.isBlank()) {
-            return null;
-        }
-        url = url.trim();
-        if (!isHttpTextureUrl(url)) {
-            LOGGER.warn("Ignoring invalid texture url ({}): {}", key, url);
+
+        Object textureVal = ScriptableObject.getProperty(tex, "texture", cx);
+        if (textureVal == Scriptable.NOT_FOUND) {
+            LOGGER.debug("load().{} must be a URL string, Symbol handle, or {{ texture, model? }}", key);
             return null;
         }
 
         Map<String, String> metadata = null;
-
         if (allowModel) {
             Object modelVal = ScriptableObject.getProperty(tex, "model", cx);
             if (modelVal != null && modelVal != Scriptable.NOT_FOUND && modelVal != Undefined.INSTANCE) {
@@ -306,25 +350,132 @@ public final class Runtime {
             }
         }
 
-        try {
-            MinecraftProfileTexture texture = new MinecraftProfileTexture(url, metadata);
-            texture.getHash(); // same validation SkinManager will perform
-            return texture;
-        } catch (Exception e) {
-            LOGGER.warn("Ignoring invalid texture url ({}): {}", key, url);
+        return resolveTextureRef(textureVal, key, metadata);
+    }
+
+    private static PendingTexture resolveTextureRef(Object textureVal, String key, Map<String, String> metadata) {
+        if (textureVal == null || textureVal == Undefined.INSTANCE || textureVal == Scriptable.NOT_FOUND) {
             return null;
         }
+
+        String contentId = TextureHandles.contentIdOf(textureVal);
+        if (contentId != null) {
+            return new PendingTexture(contentId, null, metadata);
+        }
+
+        // Only accept real strings; do not toString arbitrary objects into fake URLs.
+        if (!(textureVal instanceof CharSequence)) {
+            LOGGER.warn(
+                    "load().{}.texture must be an http(s) URL string or a Symbol handle from mode:'texture' (got {})",
+                    key,
+                    textureVal.getClass().getSimpleName()
+            );
+            return null;
+        }
+
+        String url = textureVal.toString().trim();
+        if (url.isEmpty() || "null".equals(url) || "undefined".equals(url)) {
+            return null;
+        }
+        if (!isHttpTextureUrl(url)) {
+            LOGGER.warn("Ignoring invalid texture ref ({}): {}", key, url);
+            return null;
+        }
+
+        return new PendingTexture(null, url, metadata);
+    }
+
+    private static CompletableFuture<MinecraftProfileTextures> materializeAsync(PendingTextures pending) {
+        CompletableFuture<MinecraftProfileTexture> skin = materializeOne(pending.skin());
+        CompletableFuture<MinecraftProfileTexture> cape = materializeOne(pending.cape());
+        CompletableFuture<MinecraftProfileTexture> elytra = materializeOne(pending.elytra());
+
+        return CompletableFuture.allOf(skin, cape, elytra)
+                .orTimeout(30, TimeUnit.SECONDS)
+                .handle((ignored, error) -> {
+                    if (error != null) {
+                        LOGGER.debug("Texture materialize ended early", error);
+                    }
+                    MinecraftProfileTexture s = joinTexture(skin);
+                    MinecraftProfileTexture c = joinTexture(cape);
+                    MinecraftProfileTexture e = joinTexture(elytra);
+                    if (s == null && c == null && e == null) {
+                        return MinecraftProfileTextures.EMPTY;
+                    }
+                    return new MinecraftProfileTextures(s, c, e, SignatureState.SIGNED);
+                });
+    }
+
+    private static CompletableFuture<MinecraftProfileTexture> materializeOne(PendingTexture pending) {
+        if (pending == null || pending.isEmpty()) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        if (pending.contentId() != null) {
+            try {
+                MinecraftProfileTexture tex =
+                        BinaryTextures.fromContentId(pending.contentId(), pending.metadata());
+                if (tex != null) {
+                    tex.getHash();
+                }
+                return CompletableFuture.completedFuture(tex);
+            } catch (Exception e) {
+                LOGGER.warn("Ignoring invalid texture handle {}", pending.contentId(), e);
+                return CompletableFuture.completedFuture(null);
+            }
+        }
+
+        String url = pending.url();
+        Map<String, String> metadata = pending.metadata();
+        return fetchPng(url).thenApply(png -> {
+            if (png == null || png.length == 0) {
+                LOGGER.debug("Empty PNG from {}", url);
+                return null;
+            }
+            try {
+                MinecraftProfileTexture texture = BinaryTextures.create(png, metadata);
+                if (texture != null) {
+                    texture.getHash();
+                }
+                return texture;
+            } catch (Exception e) {
+                LOGGER.warn("Ignoring invalid texture from {}", url, e);
+                return null;
+            }
+        });
+    }
+
+    private static MinecraftProfileTexture joinTexture(CompletableFuture<MinecraftProfileTexture> future) {
+        try {
+            return future.getNow(null);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static CompletableFuture<byte[]> fetchPng(String url) {
+        HttpSpec spec = new HttpSpec(url, "texture", Map.of(), true);
+        return dispatchAsync(spec).thenApply(raw -> {
+            if (raw == null || raw.status < 200 || raw.status >= 300 || !(raw.body instanceof byte[] bytes)) {
+                if (raw != null) {
+                    LOGGER.debug("PNG fetch failed status={} url={}", raw.status, url);
+                }
+                return null;
+            }
+            if (bytes.length == 0 || bytes.length > MAX_TEXTURE_BYTES) {
+                return null;
+            }
+            return bytes;
+        });
     }
 
     private static boolean isHttpTextureUrl(String url) {
         try {
             var parsed = URI.create(url).toURL();
             String scheme = parsed.getProtocol();
-
             if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
                 return false;
             }
-
             String path = parsed.getPath();
             return path != null && !path.isBlank() && !"/".equals(path);
         } catch (Exception e) {
@@ -338,10 +489,6 @@ public final class Runtime {
 
         return (id != null ? id.toString() : "unknown") + "|" + name;
     }
-
-    // -------------------------------------------------------------------------
-    // Script file I/O
-    // -------------------------------------------------------------------------
 
     private static Path scriptPath() {
         return Services.PLATFORM.getConfigDirectory().resolve(SCRIPT_NAME);
@@ -383,18 +530,6 @@ public final class Runtime {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Host: http.get / print / println
-    // -------------------------------------------------------------------------
-
-    /**
-     * Sync JS API over async Java HTTP.
-     * <pre>
-     *   http.get({ url, mode?, headers? })
-     *   http.get([{ url, mode?, headers? }, ...])  // parallel, returns when all settle
-     * </pre>
-     * Single input → single {@code { body, status }}; array → array of results (same order).
-     */
     private static final BaseFunction HTTP_GET = new BaseFunction() {
         @Override
         public Object call(Context callCx, Scriptable callScope, Scriptable thisObj, Object[] args) {
@@ -431,7 +566,6 @@ public final class Runtime {
                     return batch ? callCx.newArray(callScope, 0) : httpResult(callCx, callScope, null, 0);
                 }
 
-                // Fire all requests in parallel; JS still blocks until every one finishes.
                 List<CompletableFuture<RawHttp>> futures = new ArrayList<>(specs.size());
                 for (HttpSpec spec : specs) {
                     futures.add(dispatchAsync(spec));
@@ -440,8 +574,6 @@ public final class Runtime {
                 try {
                     CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).get(30, TimeUnit.SECONDS);
                 } catch (Exception e) {
-                    // Individual futures still complete with failures via handle();
-                    // timed-out ones stay incomplete — map below.
                     if (e instanceof InterruptedException) {
                         Thread.currentThread().interrupt();
                     }
@@ -478,15 +610,14 @@ public final class Runtime {
         }
     };
 
-    /** Parsed request spec (plain data only — safe to touch from HTTP worker threads). */
+    // Plain data only — safe to touch from HTTP worker threads (no Scriptable).
     private record HttpSpec(String url, String mode, Map<String, String> headers, boolean valid) {
         static HttpSpec invalid() {
             return new HttpSpec(null, "text", Map.of(), false);
         }
     }
 
-    /** I/O result before Rhino conversion (must not hold Scriptable). */
-    private record RawHttp(String mode, int status, String body) {
+    private record RawHttp(String mode, int status, Object body) {
         static RawHttp fail(String mode) {
             return new RawHttp(mode != null ? mode : "text", 0, null);
         }
@@ -502,7 +633,7 @@ public final class Runtime {
         Object modeVal = ScriptableObject.getProperty(req, "mode", callCx);
         if (!isAbsent(modeVal)) {
             String m = callCx.toString(modeVal).trim().toLowerCase(Locale.ROOT);
-            if ("json".equals(m) || "text".equals(m)) {
+            if ("json".equals(m) || "text".equals(m) || "texture".equals(m)) {
                 mode = m;
             } else {
                 return HttpSpec.invalid();
@@ -524,7 +655,6 @@ public final class Runtime {
             return url.toString();
         }
         if (urlVal instanceof Scriptable s) {
-            // URL-like: { href: "https://..." }
             Object href = ScriptableObject.getProperty(s, "href", callCx);
             if (!isAbsent(href)) {
                 String u = callCx.toString(href).trim();
@@ -535,7 +665,6 @@ public final class Runtime {
             String u = callCx.toString(urlVal).trim();
             return u.isEmpty() ? null : u;
         }
-        // Fallback toString (e.g. some host wrappers)
         try {
             String u = callCx.toString(urlVal).trim();
             if (u.isEmpty() || "undefined".equals(u) || "null".equals(u) || "[object Object]".equals(u)) {
@@ -554,7 +683,6 @@ public final class Runtime {
 
         Map<String, String> out = new HashMap<>();
 
-        // Headers-like: forEach(function (value, key) { ... })
         Object forEach = ScriptableObject.getProperty(headersObj, "forEach", callCx);
         if (forEach instanceof Callable forEachFn) {
             try {
@@ -579,7 +707,6 @@ public final class Runtime {
             }
         }
 
-        // Plain object / Record<string, string>
         for (Object id : headersObj.getIds(callCx)) {
             String key;
             if (id instanceof String s) {
@@ -617,11 +744,13 @@ public final class Runtime {
             return CompletableFuture.completedFuture(RawHttp.fail(spec.mode));
         }
 
+        // Some CDNs return 406 for application/octet-stream; use */* for non-JSON.
+        String accept = "json".equals(spec.mode) ? "application/json" : "*/*";
         HttpRequest.Builder builder = HttpRequest.newBuilder()
                 .uri(uri)
                 .timeout(Duration.ofSeconds(15))
                 .GET()
-                .header("Accept", "json".equals(spec.mode) ? "application/json" : "*/*");
+                .header("Accept", accept);
 
         boolean hasUserAgent = false;
         for (Map.Entry<String, String> h : spec.headers.entrySet()) {
@@ -631,7 +760,6 @@ public final class Runtime {
                     hasUserAgent = true;
                 }
             } catch (IllegalArgumentException ignored) {
-                // skip invalid header
             }
         }
         if (!hasUserAgent) {
@@ -639,6 +767,17 @@ public final class Runtime {
         }
 
         final String mode = spec.mode;
+        if ("texture".equals(mode)) {
+            return HTTP.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofByteArray())
+                    .handle((response, error) -> {
+                        if (error != null || response == null) {
+                            return RawHttp.fail(mode);
+                        }
+                        byte[] body = response.body() != null ? response.body() : new byte[0];
+                        return new RawHttp(mode, response.statusCode(), body);
+                    });
+        }
+
         return HTTP.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofString())
                 .handle((response, error) -> {
                     if (error != null || response == null) {
@@ -653,12 +792,23 @@ public final class Runtime {
         Object body;
         if (raw.body == null) {
             body = null;
+        } else if ("texture".equals(raw.mode)) {
+            byte[] bytes = (byte[]) raw.body;
+            if (raw.status < 200 || raw.status >= 300 || bytes.length == 0) {
+                body = null;
+            } else if (bytes.length > MAX_TEXTURE_BYTES) {
+                LOGGER.warn("http.get texture response too large ({} bytes, max {})", bytes.length, MAX_TEXTURE_BYTES);
+                body = null;
+            } else {
+                body = TextureHandles.create(callCx, callScope, bytes);
+            }
         } else if ("json".equals(raw.mode)) {
-            if (raw.body.isBlank()) {
+            String text = (String) raw.body;
+            if (text.isBlank()) {
                 body = null;
             } else {
                 try {
-                    body = NativeJSON.parse(callCx, callScope, raw.body, JSON_IDENTITY_REVIVER);
+                    body = NativeJSON.parse(callCx, callScope, text, JSON_IDENTITY_REVIVER);
                 } catch (Exception e) {
                     LOGGER.debug("JSON parse failed (status {})", raw.status, e);
                     body = null;
@@ -670,8 +820,107 @@ public final class Runtime {
         return httpResult(callCx, callScope, body, raw.status);
     }
 
+    private static final BaseFunction FS_READ_FILE = new BaseFunction() {
+        @Override
+        public Object call(Context callCx, Scriptable callScope, Scriptable thisObj, Object[] args) {
+            try {
+                if (args == null || args.length == 0 || isAbsent(args[0]) || !(args[0] instanceof Scriptable req)) {
+                    return httpResult(callCx, callScope, null, 0);
+                }
+
+                Object pathVal = ScriptableObject.getProperty(req, "path", callCx);
+                if (isAbsent(pathVal)) {
+                    return httpResult(callCx, callScope, null, 0);
+                }
+                String pathStr = callCx.toString(pathVal).trim();
+                if (pathStr.isEmpty() || "null".equals(pathStr) || "undefined".equals(pathStr)) {
+                    return httpResult(callCx, callScope, null, 0);
+                }
+
+                String mode = "texture";
+                Object modeVal = ScriptableObject.getProperty(req, "mode", callCx);
+                if (!isAbsent(modeVal)) {
+                    String m = callCx.toString(modeVal).trim().toLowerCase(Locale.ROOT);
+                    if ("texture".equals(m) || "text".equals(m) || "json".equals(m)) {
+                        mode = m;
+                    } else {
+                        return httpResult(callCx, callScope, null, 0);
+                    }
+                }
+
+                Path resolved = resolveConfigPath(pathStr);
+                if (resolved == null) {
+                    LOGGER.debug("fs.readFile rejected path: {}", pathStr);
+                    return httpResult(callCx, callScope, null, 0);
+                }
+
+                if (!Files.isRegularFile(resolved)) {
+                    return httpResult(callCx, callScope, null, 0);
+                }
+
+                long size = Files.size(resolved);
+                if (size < 0 || size > MAX_TEXTURE_BYTES) {
+                    LOGGER.warn("fs.readFile too large or invalid ({} bytes): {}", size, resolved);
+                    return httpResult(callCx, callScope, null, 0);
+                }
+
+                byte[] bytes = Files.readAllBytes(resolved);
+
+                Object body;
+                if ("texture".equals(mode)) {
+                    if (bytes.length == 0) {
+                        body = null;
+                    } else {
+                        body = TextureHandles.create(callCx, callScope, bytes);
+                    }
+                } else if ("json".equals(mode)) {
+                    String text = new String(bytes, StandardCharsets.UTF_8);
+                    if (text.isBlank()) {
+                        body = null;
+                    } else {
+                        try {
+                            body = NativeJSON.parse(callCx, callScope, text, JSON_IDENTITY_REVIVER);
+                        } catch (Exception e) {
+                            LOGGER.debug("fs.readFile JSON parse failed for {}", resolved, e);
+                            body = null;
+                        }
+                    }
+                } else {
+                    body = new String(bytes, StandardCharsets.UTF_8);
+                }
+
+                return httpResult(callCx, callScope, body, body == null && !"text".equals(mode) ? 0 : 200);
+            } catch (Throwable t) {
+                LOGGER.debug("fs.readFile failed", t);
+                return httpResult(callCx, callScope, null, 0);
+            }
+        }
+
+        @Override
+        public String getFunctionName() {
+            return "readFile";
+        }
+    };
+
+    /** Paths must stay under the game config directory (no {@code ..} escape). */
+    private static Path resolveConfigPath(String pathStr) {
+        try {
+            Path configRoot = Services.PLATFORM.getConfigDirectory().toAbsolutePath().normalize();
+            Path raw = Path.of(pathStr);
+            Path resolved = raw.isAbsolute()
+                    ? raw.normalize()
+                    : configRoot.resolve(raw).normalize();
+
+            if (!resolved.startsWith(configRoot)) {
+                return null;
+            }
+            return resolved;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     private static boolean isJsArray(Context callCx, Scriptable s) {
-        // Prefer real arrays; avoid treating request objects that happen to have length.
         if (s.getClassName() != null && "Array".equals(s.getClassName())) {
             return true;
         }
@@ -679,7 +928,6 @@ public final class Runtime {
         if (!(length instanceof Number n) || n.doubleValue() < 0 || n.doubleValue() != Math.floor(n.doubleValue())) {
             return false;
         }
-        // Request objects have `url`; arrays of requests should not.
         Object url = ScriptableObject.getProperty(s, "url", callCx);
         return isAbsent(url);
     }
@@ -688,7 +936,7 @@ public final class Runtime {
         Object length = ScriptableObject.getProperty(s, "length", callCx);
         if (length instanceof Number n) {
             int len = n.intValue();
-            return Math.max(0, Math.min(len, 16)); // hard cap
+            return Math.max(0, Math.min(len, 16));
         }
         return 0;
     }
@@ -700,7 +948,6 @@ public final class Runtime {
         return obj;
     }
 
-    /** {@code print(string)} — strings only, no newline. */
     private static final BaseFunction PRINT = new BaseFunction() {
         @Override
         public Object call(Context callCx, Scriptable callScope, Scriptable thisObj, Object[] args) {
@@ -717,7 +964,6 @@ public final class Runtime {
         }
     };
 
-    /** {@code println(string)} — strings only, newline. */
     private static final BaseFunction PRINTLN = new BaseFunction() {
         @Override
         public Object call(Context callCx, Scriptable callScope, Scriptable thisObj, Object[] args) {

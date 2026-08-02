@@ -27,5 +27,9 @@ versionRange = "${minecraft_version_range}"
 ordering = "NONE"
 side = "CLIENT"
 
-# Rhino is embedded via Jar-in-Jar; no separate install required.
-# If a standalone Rhino is also present, JarJar will negotiate the version.
+[[dependencies.${mod_id}]]
+modId = "rhino"
+type = "required"
+versionRange = "[${rhino_version},)"
+ordering = "NONE"
+side = "CLIENT"

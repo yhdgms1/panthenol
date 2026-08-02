@@ -8,6 +8,7 @@
     "SkinManagerMixin",
     "PlayerInfoMixin",
     "TextureCacheMixin",
+    "SkinTextureDownloaderMixin",
     "ClientPacketListenerMixin"
   ],
   "server": [],

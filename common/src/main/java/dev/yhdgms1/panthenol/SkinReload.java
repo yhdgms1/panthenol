@@ -7,14 +7,8 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Coordinates forced re-download of player textures.
- * <p>
- * Minecraft's {@code SkinManager.TextureCache} keys by the basename of the texture URL
- * and never expires. {@code HttpTexture} also keeps a disk file per hash and will not
- * re-fetch while that file exists. TLauncher-style APIs often keep a stable URL when the
- * PNG bytes change, so clearing only Panthenol's JS memo is not enough — the hash must be
- * marked here so the next {@code TextureCache#getOrLoad} drops the in-memory entry and
- * disk file before registering again.
+ * Marks texture hashes for one-shot eviction from SkinManager's in-memory TextureCache
+ * when {@code config.cache} is false and the same content id is reloaded.
  */
 public final class SkinReload {
     private static final Set<String> EVICT_HASHES = ConcurrentHashMap.newKeySet();
@@ -43,13 +37,9 @@ public final class SkinReload {
                 EVICT_HASHES.add(hash);
             }
         } catch (RuntimeException ignored) {
-            // invalid URL — nothing cached under a usable hash
         }
     }
 
-    /**
-     * @return {@code true} once if this hash was marked for eviction (caller should drop caches)
-     */
     public static boolean pollEvict(String hash) {
         return hash != null && EVICT_HASHES.remove(hash);
     }

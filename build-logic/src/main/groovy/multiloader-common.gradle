@@ -3,7 +3,6 @@ plugins {
     id 'maven-publish'
 }
 
-// Gradle Project.description is used in mod metadata expansion.
 project.description = findProperty('mod_description') ?: ''
 
 base {
@@ -16,10 +15,9 @@ java {
     withJavadocJar()
 }
 
-// Quiet Javadoc: no doclint, never fail the build on missing comments.
 tasks.withType(Javadoc).configureEach {
     options.encoding = 'UTF-8'
-    // -Xdoclint:none needs to be passed as a single free-form option on some JDKs
+    // -Xdoclint:none needs to be a single free-form option on some JDKs
     options.addStringOption('Xdoclint:none', '-quiet')
     failOnError = false
 }

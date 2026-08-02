@@ -26,14 +26,19 @@ public abstract class SkinManagerMixin {
     @Inject(method = "get", at = @At("HEAD"), cancellable = true)
     private void panthenol$loadFromScript(GameProfile profile, CallbackInfoReturnable<CompletableFuture<Optional<PlayerSkin>>> cir) {
         try {
-            MinecraftProfileTextures textures = Runtime.resolveTextures(profile);
-
-            if (textures == null) {
-                // Runtime unavailable — leave vanilla path.
+            Runtime.start();
+            if (!Runtime.isAvailable()) {
                 return;
             }
 
-            cir.setReturnValue(this.registerTextures(profile.id(), textures).thenApply(Optional::ofNullable));
+            cir.setReturnValue(
+                    Runtime.resolveTexturesAsync(profile)
+                            .thenCompose(textures -> {
+                                MinecraftProfileTextures t =
+                                        textures != null ? textures : MinecraftProfileTextures.EMPTY;
+                                return this.registerTextures(profile.id(), t).thenApply(Optional::ofNullable);
+                            })
+            );
         } catch (Throwable t) {
             Constants.LOG.error("Panthenol skin hook failed for {}", profile != null ? profile.name() : "?", t);
 
@@ -41,7 +46,6 @@ public abstract class SkinManagerMixin {
                 cir.setReturnValue(this.registerTextures(profile.id(), MinecraftProfileTextures.EMPTY)
                         .thenApply(Optional::ofNullable));
             } catch (Throwable ignored) {
-                // leave vanilla if EMPTY registration also fails
             }
         }
     }

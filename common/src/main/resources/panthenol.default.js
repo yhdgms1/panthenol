@@ -1,44 +1,56 @@
-const SKIN_BASE = 'https://auth.tlauncher.org/';
+const API_BASE = 'https://auth.tlauncher.org';
+const PROFILE_URL = API_BASE + '/skin/v1/profile/texture/login/';
 
-const toAbsoluteURL = (url) => {
-    if (!url) return null;
-    if (/^https?:\/\//i.test(url)) return url;
-
-    return SKIN_BASE + String(url).replace(/^\/+/, '');
+const withBaseURL = function (path) {
+    if (!path) return null;
+    if (/^https?:\/\//i.test(path)) return path;
+    return API_BASE + '/' + String(path).replace(/^\/+/, '');
 };
 
-const load = (params) => {
-    // Single request: object form. For several URLs use an array — they run in parallel.
-    const response = http.get({
-        url: `https://auth.tlauncher.org/skin/v1/profile/texture/login/${encodeURIComponent(params.name)}`,
+const isSuccess = function (response) {
+    return response &&
+        response.status >= 200 &&
+        response.status < 300;
+};
+
+/**
+ * `texture` is either:
+ *   - http(s) URL string  → Java downloads the PNG
+ *   - Symbol handle       → from http.get / fs.readFile with mode: 'texture'
+ *
+ * Examples:
+ *   skin: { texture: 'https://…/a.png', model: 'slim' }
+ *   skin: { texture: fs.readFile({ path: 'panthenol/a.png' }).body, model: 'slim' }
+ *   cape: handle   // shorthand when no model
+ */
+const load = function (params) {
+    const profile = http.get({
+        url: PROFILE_URL + encodeURIComponent(params.name),
         mode: 'json'
     });
 
-    if (!response || response.status < 200 || response.status >= 300 || !response.body) {
+    if (!isSuccess(profile) || !profile.body) {
         return null;
     }
 
-    const data = response.body;
+    const SKIN = profile.body.SKIN;
+    const CAPE = profile.body.CAPE;
     const result = {};
 
-    if (data.SKIN && data.SKIN.url) {
+    if (SKIN && SKIN.url) {
         result.skin = {
-            url: toAbsoluteURL(data.SKIN.url),
-            model: data.SKIN.metadata && data.SKIN.metadata.model
+            texture: withBaseURL(SKIN.url),
+            model: SKIN.metadata ? SKIN.metadata.model : undefined
         };
     }
 
-    if (data.CAPE && data.CAPE.url) {
+    if (CAPE && CAPE.url) {
         result.cape = {
-            url: toAbsoluteURL(data.CAPE.url)
+            texture: withBaseURL(CAPE.url)
         };
     }
 
-    if (!result.skin && !result.cape) {
-        return null;
-    }
-
-    return result;
+    return result.skin || result.cape ? result : null;
 };
 
 const config = {
